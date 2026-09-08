@@ -18,4 +18,17 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     (Join-Path $projectRoot "DellPowerMeter.spec")
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+$settingsPath = Join-Path $projectRoot "dist\dpm_ui.ini"
+if (-not (Test-Path -LiteralPath $settingsPath)) {
+    $sourceSettings = Join-Path $projectRoot "src\dpm_ui.ini"
+    if (Test-Path -LiteralPath $sourceSettings) {
+        Copy-Item -LiteralPath $sourceSettings -Destination $settingsPath
+    } else {
+        Set-Content -LiteralPath $settingsPath -Encoding ASCII -Value @(
+            "[window]", "width = 920", "height = 980", "maximized = False"
+        )
+    }
+}
+
 Write-Host "Built: $projectRoot\dist\Spike Power Meter.exe"
+Write-Host "Window settings: $settingsPath"

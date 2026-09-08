@@ -82,6 +82,10 @@ From PowerShell in the project root, run:
 The single-file, windowed application is written to `dist\Spike Power Meter.exe`.
 It embeds Python, the Python packages, CustomTkinter assets, and the Digital-7
 font, so the target Windows computer does not need Python or supporting files.
+The build also places `dpm_ui.ini` beside the executable to store the window
+size and maximized state. Existing settings are preserved when rebuilding;
+on the first build, settings are copied from `src/dpm_ui.ini` if available.
+Keep the executable in a writable folder so it can save settings when closed.
 
 1.  Select the COM Port for your device.
 2.  Click Connect.
