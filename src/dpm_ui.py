@@ -3,7 +3,7 @@ import serial
 import serial.tools.list_ports
 import threading
 from collections import deque
-import matplotlib.pyplot as plt
+from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import os
 import ctypes
@@ -147,7 +147,10 @@ class PowerMeterApp(ctk.CTk):
         self.hold_btn.pack(side="right", padx=10)
         self._scalable_pack.append((self.hold_btn, {"side": "right", "padx": 10}))
 
-        self.fig, self.ax = plt.subplots(figsize=(5, 3), dpi=100)
+        # Construct the embedded figure directly: pyplot.subplots() also creates
+        # a separate Tk window/manager, which can keep the event loop alive.
+        self.fig = Figure(figsize=(5, 3), dpi=100)
+        self.ax = self.fig.add_subplot(111)
         self.fig.patch.set_facecolor('#1a1a1a')
         self.ax.set_facecolor('#1a1a1a')
         self.line_v, = self.ax.plot(range(50), list(self.history_v), color='cyan', visible=False)
@@ -216,12 +219,15 @@ class PowerMeterApp(ctk.CTk):
         except OSError as e:
             print(f"Could not save window settings: {e}")
         self.running = False
-        if self.ser:
-            self.ser.close()
-        if self._resize_after_id:
-            self.after_cancel(self._resize_after_id)
-        plt.close(self.fig)
-        self.destroy()
+        try:
+            if self.ser:
+                self.ser.close()
+        except (OSError, serial.SerialException) as e:
+            print(f"Could not close serial port: {e}")
+        finally:
+            # Explicitly stop the event loop, even if resource cleanup fails.
+            self.quit()
+            self.destroy()
 
     def _on_resize(self, event):
         if event.widget is not self:
