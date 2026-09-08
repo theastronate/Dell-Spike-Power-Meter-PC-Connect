@@ -7,6 +7,9 @@ import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import os
 import ctypes
+import configparser
+import sys
+from pathlib import Path
 
 # Base design dimensions (original geometry)
 BASE_WIDTH = 920
@@ -23,7 +26,11 @@ class PowerMeterApp(ctk.CTk):
 
         super().__init__()
         self.title("Spike Power Meter")
-        self.geometry(f"{BASE_WIDTH}x{BASE_HEIGHT}")
+        settings_dir = Path(sys.executable if getattr(sys, "frozen", False) else __file__).resolve().parent
+        self._settings_path = settings_dir / "dpm_ui.ini"
+        settings = self._load_window_settings()
+        self._normal_size = (settings["width"], settings["height"])
+        self.geometry(f'{settings["width"]}x{settings["height"]}')
         ctk.set_appearance_mode("dark")
 
         try:
@@ -169,10 +176,57 @@ class PowerMeterApp(ctk.CTk):
         # Bind resize event and fit the initial display even at 100% DPI.
         self.bind("<Configure>", self._on_resize)
         self._resize_after_id = self.after(100, self._apply_scale)
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+        if settings["maximized"]:
+            self.state("zoomed")
+
+    def _load_window_settings(self):
+        defaults = {"width": BASE_WIDTH, "height": BASE_HEIGHT, "maximized": False}
+        try:
+            config = configparser.ConfigParser()
+            config.read_string(self._settings_path.read_text(encoding="utf-8"))
+            settings = config["window"]
+            for key in ("width", "height"):
+                value = settings.getint(key)
+                if value is None or not 100 <= value <= 20000:
+                    return defaults
+            return {"width": settings.getint("width"), "height": settings.getint("height"),
+                    "maximized": settings.getboolean("maximized", fallback=False)}
+        except (OSError, ValueError, KeyError, configparser.Error):
+            return defaults
+
+    def _remember_normal_size(self):
+        if self.state() == "normal" and self.winfo_width() > 1 and self.winfo_height() > 1:
+            # Persist logical dimensions so reopening at another DPI scales once.
+            dpi_scale = self._get_window_scaling()
+            self._normal_size = (round(self.winfo_width() / dpi_scale),
+                                 round(self.winfo_height() / dpi_scale))
+
+    def _on_close(self):
+        self._remember_normal_size()
+        settings = {"width": self._normal_size[0], "height": self._normal_size[1],
+                    "maximized": self.state() == "zoomed"}
+        try:
+            config = configparser.ConfigParser()
+            config["window"] = {key: str(value) for key, value in settings.items()}
+            temporary_path = self._settings_path.with_suffix(".tmp")
+            with temporary_path.open("w", encoding="utf-8") as settings_file:
+                config.write(settings_file)
+            temporary_path.replace(self._settings_path)
+        except OSError as e:
+            print(f"Could not save window settings: {e}")
+        self.running = False
+        if self.ser:
+            self.ser.close()
+        if self._resize_after_id:
+            self.after_cancel(self._resize_after_id)
+        plt.close(self.fig)
+        self.destroy()
 
     def _on_resize(self, event):
         if event.widget is not self:
             return
+        self._remember_normal_size()
         if self._resize_after_id:
             self.after_cancel(self._resize_after_id)
         self._resize_after_id = self.after(100, self._apply_scale)
