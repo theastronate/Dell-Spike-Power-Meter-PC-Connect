@@ -62,7 +62,8 @@ class PowerMeterApp(ctk.CTk):
         self._scalable_pack = []     # (widget, {base pack kwargs})
         self._quadrant_refs = []     # (slot_labels, unit_lbl, header_lbl, quadrant_frame)
         self._resize_after_id = None
-        self._last_scale = 1.0
+        self._last_scale = 0.0
+        self._layout_base_width = BASE_WIDTH
 
         # --- 2. UI LAYOUT ---
         self.conn_frame = ctk.CTkFrame(self)
@@ -156,8 +157,18 @@ class PowerMeterApp(ctk.CTk):
         self._scalable_pack.append((self.raw_data_lbl, {"pady": 5}))
         self._scalable_labels.append((self.raw_data_lbl, "Courier", 12, ""))
 
-        # Bind resize event
+        # Measure the natural layout before applying responsive scaling. Font
+        # metrics (including the fallback font) can require more than 920 units.
+        self.update_idletasks()
+        widget_scale = self.lcd_frame._get_widget_scaling()
+        self._layout_base_width = max(
+            BASE_WIDTH,
+            self.display_container.winfo_reqwidth() / widget_scale + 40 + 24,
+        )
+
+        # Bind resize event and fit the initial display even at 100% DPI.
         self.bind("<Configure>", self._on_resize)
+        self._resize_after_id = self.after(100, self._apply_scale)
 
     def _on_resize(self, event):
         if event.widget is not self:
@@ -173,9 +184,15 @@ class PowerMeterApp(ctk.CTk):
         return max(0, int(base_val * scale))
 
     def _apply_scale(self):
+        self._resize_after_id = None
         w = self.winfo_width()
         h = self.winfo_height()
-        scale = min(w / BASE_WIDTH, h / BASE_HEIGHT)
+        # Tk reports physical pixels, while CTk geometry and font sizes use
+        # logical units. Remove CTk's current monitor/window scaling here so
+        # its automatic font scaling does not apply the DPI factor twice.
+        window_scale = self._get_window_scaling()
+        scale = min(w / window_scale / self._layout_base_width,
+                    h / window_scale / BASE_HEIGHT)
         if abs(scale - self._last_scale) < 0.005:
             return
         self._last_scale = scale
@@ -193,10 +210,12 @@ class PowerMeterApp(ctk.CTk):
                 if lbl.cget("width") != 0:
                     lbl.configure(width=max(10, int(65 * scale)))
             unit_lbl.configure(font=("Arial", unit_size, "bold"))
-            unit_lbl.pack_configure(padx=unit_padx, pady=(unit_pady_top, 0))
+            unit_lbl.pack(side="left", padx=unit_padx, pady=(unit_pady_top, 0))
             header_lbl.configure(font=("Arial", label_size, "bold"))
             # Scale the quadrant grid cell padding
-            quad_frame.grid_configure(
+            quad_frame.grid(
+                row=quad_frame.grid_info()["row"],
+                column=quad_frame.grid_info()["column"], sticky="nsew",
                 padx=max(2, int(20 * scale)),
                 pady=max(2, int(20 * scale))
             )
@@ -215,7 +234,7 @@ class PowerMeterApp(ctk.CTk):
                     new_kwargs[k] = self._scaled_pad(v, scale)
                 else:
                     new_kwargs[k] = v
-            widget.pack_configure(**new_kwargs)
+            widget.pack(**new_kwargs)
 
         # --- Resize matplotlib figure proportionally ---
         fig_w = max(2, (w - 20) / 100)
