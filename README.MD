@@ -83,9 +83,16 @@ The single-file, windowed application is written to `dist\Spike Power Meter.exe`
 It embeds Python, the Python packages, CustomTkinter assets, and the Digital-7
 font, so the target Windows computer does not need Python or supporting files.
 The build also places `dpm_ui.ini` beside the executable to store the window
-size and maximized state. Existing settings are preserved when rebuilding;
+size, screen position, maximized state, last successfully connected COM port,
+and the Autoconnect checkbox setting. A saved position that no longer fits on
+a connected monitor is reset to a safe location on the primary monitor.
+Enable Autoconnect to try the saved COM port once at startup; connection errors
+appear in the dashboard so you can select another port and connect manually.
+Existing settings are preserved when rebuilding;
 on the first build, settings are copied from `src/dpm_ui.ini` if available.
 Keep the executable in a writable folder so it can save settings when closed.
+Local INI settings and the generated `dist` directory are excluded from Git.
+The dashboard uses built-in defaults when no INI file exists.
 
 1.  Select the COM Port for your device.
 2.  Click Connect.

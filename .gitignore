@@ -8,4 +8,8 @@
 __pycache__/
 *.py[cod]
 /build/
-/dist/*.exe
+/dist/
+
+# Local dashboard settings (created and updated by the app)
+/src/dpm_ui.ini
+/src/dpm_ui.tmp

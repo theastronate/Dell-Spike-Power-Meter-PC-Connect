@@ -7,6 +7,7 @@ from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import os
 import ctypes
+from ctypes import wintypes
 import configparser
 import sys
 from pathlib import Path
@@ -29,6 +30,8 @@ class PowerMeterApp(ctk.CTk):
         settings_dir = Path(sys.executable if getattr(sys, "frozen", False) else __file__).resolve().parent
         self._settings_path = settings_dir / "dpm_ui.ini"
         settings = self._load_window_settings()
+        self._last_port = settings["last_port"]
+        self.autoconnect_var = ctk.BooleanVar(value=settings["autoconnect"])
         self._normal_size = (settings["width"], settings["height"])
         self.geometry(f'{settings["width"]}x{settings["height"]}')
         ctk.set_appearance_mode("dark")
@@ -77,7 +80,7 @@ class PowerMeterApp(ctk.CTk):
         self.conn_frame.pack(fill="x", padx=10, pady=5)
         self._scalable_pack.append((self.conn_frame, {"fill": "x", "padx": 10, "pady": 5}))
 
-        self.port_var = ctk.StringVar(value="Select Port")
+        self.port_var = ctk.StringVar(value=self._last_port or "Select Port")
         self.port_menu = ctk.CTkOptionMenu(self.conn_frame, variable=self.port_var, values=self.get_ports())
         self.port_menu.pack(side="left", padx=10, pady=10)
         self._scalable_pack.append((self.port_menu, {"side": "left", "padx": 10, "pady": 10}))
@@ -89,6 +92,13 @@ class PowerMeterApp(ctk.CTk):
         self.connect_btn = ctk.CTkButton(self.conn_frame, text="Connect", fg_color="green", command=self.toggle_connection)
         self.connect_btn.pack(side="left", padx=10)
         self._scalable_pack.append((self.connect_btn, {"side": "left", "padx": 10}))
+
+        self.autoconnect_checkbox = ctk.CTkCheckBox(
+            self.conn_frame, text="Autoconnect", variable=self.autoconnect_var,
+            command=self._save_settings,
+        )
+        self.autoconnect_checkbox.pack(side="left", padx=5)
+        self._scalable_pack.append((self.autoconnect_checkbox, {"side": "left", "padx": 5}))
 
         self.status_dot = ctk.CTkLabel(self.conn_frame, text="●", text_color="red", font=("Arial", 24))
         self.status_dot.pack(side="right", padx=10)
@@ -177,26 +187,103 @@ class PowerMeterApp(ctk.CTk):
         )
 
         # Bind resize event and fit the initial display even at 100% DPI.
+        self._restore_position(settings["x"], settings["y"])
         self.bind("<Configure>", self._on_resize)
         self._resize_after_id = self.after(100, self._apply_scale)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         if settings["maximized"]:
             self.state("zoomed")
+        if self.autoconnect_var.get() and self._last_port:
+            self.after(250, self._autoconnect)
 
     def _load_window_settings(self):
-        defaults = {"width": BASE_WIDTH, "height": BASE_HEIGHT, "maximized": False}
+        defaults = {"width": BASE_WIDTH, "height": BASE_HEIGHT, "maximized": False,
+                    "x": None, "y": None, "last_port": "", "autoconnect": False}
+        config = configparser.ConfigParser(interpolation=None)
         try:
-            config = configparser.ConfigParser()
             config.read_string(self._settings_path.read_text(encoding="utf-8"))
-            settings = config["window"]
-            for key in ("width", "height"):
-                value = settings.getint(key)
-                if value is None or not 100 <= value <= 20000:
-                    return defaults
-            return {"width": settings.getint("width"), "height": settings.getint("height"),
-                    "maximized": settings.getboolean("maximized", fallback=False)}
-        except (OSError, ValueError, KeyError, configparser.Error):
+        except (OSError, configparser.Error):
             return defaults
+        for key in defaults:
+            section = "connection" if key in ("last_port", "autoconnect") else "window"
+            try:
+                if key in ("maximized", "autoconnect"):
+                    defaults[key] = config.getboolean(section, key, fallback=defaults[key])
+                elif key == "last_port":
+                    defaults[key] = config.get(section, key, fallback="").strip()
+                else:
+                    value = config.getint(section, key, fallback=defaults[key])
+                    if key in ("x", "y") or 100 <= value <= 20000:
+                        defaults[key] = value
+            except (ValueError, configparser.Error):
+                pass
+        return defaults
+
+    def _window_rect(self):
+        if sys.platform == "win32":
+            rect = wintypes.RECT()
+            hwnd = wintypes.HWND(int(self.frame(), 0))
+            if ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+                return rect.left, rect.top, rect.right, rect.bottom
+        x, y = self.winfo_x(), self.winfo_y()
+        return x, y, x + self.winfo_width(), y + self.winfo_height()
+
+    def _monitor_work_areas(self):
+        areas = []
+        if sys.platform == "win32":
+            class MonitorInfo(ctypes.Structure):
+                _fields_ = [("cbSize", wintypes.DWORD), ("rcMonitor", wintypes.RECT),
+                            ("rcWork", wintypes.RECT), ("dwFlags", wintypes.DWORD)]
+
+            callback_type = ctypes.WINFUNCTYPE(
+                wintypes.BOOL, wintypes.HANDLE, wintypes.HDC,
+                ctypes.POINTER(wintypes.RECT), wintypes.LPARAM,
+            )
+
+            @callback_type
+            def collect(monitor, dc, rect, data):
+                info = MonitorInfo()
+                info.cbSize = ctypes.sizeof(info)
+                if ctypes.windll.user32.GetMonitorInfoW(wintypes.HANDLE(monitor), ctypes.byref(info)):
+                    work = info.rcWork
+                    area = (work.left, work.top, work.right, work.bottom)
+                    if info.dwFlags & 1:  # Primary monitor is the safe fallback.
+                        areas.insert(0, area)
+                    else:
+                        areas.append(area)
+                return True
+
+            ctypes.windll.user32.EnumDisplayMonitors(None, None, collect, 0)
+        return areas or [(0, 0, self.winfo_screenwidth(), self.winfo_screenheight())]
+
+    def _restore_position(self, x, y):
+        areas = self._monitor_work_areas()
+        left, top, right, bottom = self._window_rect()
+        width, height = right - left, bottom - top
+        # Require the whole frame to fit, including the title bar and borders.
+        if x is None or y is None or not any(
+            l <= x and t <= y and x + width <= r and y + height <= b
+            for l, t, r, b in areas
+        ):
+            l, t, r, b = areas[0]
+            scale = self._get_window_scaling()
+            border_w = width - self.winfo_width()
+            border_h = height - self.winfo_height()
+            self._normal_size = (
+                min(self._normal_size[0], int((r - l - border_w - 40) / scale)),
+                min(self._normal_size[1], int((b - t - border_h - 40) / scale)),
+            )
+            self.geometry(f"{self._normal_size[0]}x{self._normal_size[1]}")
+            self.update_idletasks()
+            x, y = l + 20, t + 20
+        if sys.platform == "win32":
+            # Native coordinates support monitors left of/above the primary.
+            ctypes.windll.user32.SetWindowPos(
+                wintypes.HWND(int(self.frame(), 0)), None, x, y, 0, 0, 0x0015,
+            )  # NOSIZE | NOZORDER | NOACTIVATE
+        else:
+            self.tk.call("wm", "geometry", self._w, f"+{x}+{y}")
+        self._normal_position = (x, y)
 
     def _remember_normal_size(self):
         if self.state() == "normal" and self.winfo_width() > 1 and self.winfo_height() > 1:
@@ -204,20 +291,27 @@ class PowerMeterApp(ctk.CTk):
             dpi_scale = self._get_window_scaling()
             self._normal_size = (round(self.winfo_width() / dpi_scale),
                                  round(self.winfo_height() / dpi_scale))
+            self._normal_position = self._window_rect()[:2]
 
-    def _on_close(self):
+    def _save_settings(self):
         self._remember_normal_size()
         settings = {"width": self._normal_size[0], "height": self._normal_size[1],
+                    "x": self._normal_position[0], "y": self._normal_position[1],
                     "maximized": self.state() == "zoomed"}
         try:
             config = configparser.ConfigParser()
             config["window"] = {key: str(value) for key, value in settings.items()}
+            config["connection"] = {"last_port": self._last_port,
+                                    "autoconnect": str(self.autoconnect_var.get())}
             temporary_path = self._settings_path.with_suffix(".tmp")
             with temporary_path.open("w", encoding="utf-8") as settings_file:
                 config.write(settings_file)
             temporary_path.replace(self._settings_path)
         except OSError as e:
-            print(f"Could not save window settings: {e}")
+            print(f"Could not save settings: {e}")
+
+    def _on_close(self):
+        self._save_settings()
         self.running = False
         try:
             if self.ser:
@@ -296,10 +390,9 @@ class PowerMeterApp(ctk.CTk):
                     new_kwargs[k] = v
             widget.pack(**new_kwargs)
 
-        # --- Resize matplotlib figure proportionally ---
-        fig_w = max(2, (w - 20) / 100)
-        fig_h = max(1.5, (h * 0.30) / 100)
-        self.fig.set_size_inches(fig_w, fig_h)
+        # FigureCanvasTkAgg resizes the figure and its backing image together
+        # when Tk allocates the canvas. Resizing only the figure here leaves
+        # stale pixels (including old axes) in the larger backing image.
         self.canvas.draw_idle()
 
     def create_lcd_quadrant(self, r, c, label_text, num_slots, unit_text, color, dot_idx):
@@ -352,8 +445,15 @@ class PowerMeterApp(ctk.CTk):
     def refresh_ports(self):
         new_ports = self.get_ports()
         self.port_menu.configure(values=new_ports)
-        if new_ports:
+        if self.port_var.get() not in new_ports and self._last_port in new_ports:
+            self.port_var.set(self._last_port)
+        elif self.port_var.get() not in new_ports and new_ports:
             self.port_var.set(new_ports[0])
+
+    def _autoconnect(self):
+        if not self.running and self.autoconnect_var.get() and self._last_port:
+            self.port_var.set(self._last_port)
+            self.toggle_connection()
 
     def toggle_connection(self):
         if not self.running:
@@ -363,6 +463,8 @@ class PowerMeterApp(ctk.CTk):
             try:
                 self.ser = serial.Serial(port, 115200, timeout=0.1)
                 self.running = True
+                self._last_port = port
+                self._save_settings()
                 self.connect_btn.configure(text="Disconnect", fg_color="red")
                 self.status_dot.configure(text_color="green")
                 threading.Thread(target=self.listen_serial, daemon=True).start()
