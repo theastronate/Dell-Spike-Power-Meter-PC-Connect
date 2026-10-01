@@ -2,6 +2,8 @@ import customtkinter as ctk
 import serial
 import serial.tools.list_ports
 import threading
+import queue
+import math
 from collections import deque
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
@@ -59,13 +61,16 @@ class PowerMeterApp(ctk.CTk):
             print(f"Font error: {e}")
 
         # Data & Control State
-        self.history_v = deque([0.0]*50, maxlen=50)
-        self.history_i = deque([0.0]*50, maxlen=50)
-        self.history_p = deque([0.0]*50, maxlen=50)
-        self.max_current = 0.0
-        self.ser = None
-        self.running = False
         self.is_held = False
+        self.sources = [self._new_source(), self._new_source()]
+        self.history_v, self.history_i, self.history_p = self.sources[0]["history"]
+        self.active_source = settings["active_source"] if settings["second_enabled"] else 0
+        self._serial_events = queue.Queue(maxsize=1000)
+        self.second_enabled_var = ctk.BooleanVar(value=settings["second_enabled"])
+        self.source_ports = [ctk.StringVar(value=settings["last_port"] or "Select Port"),
+                             ctk.StringVar(value=settings["second_port"] or "Select Port")]
+        self.source_names = [ctk.StringVar(value=settings["first_name"]),
+                             ctk.StringVar(value=settings["second_name"])]
 
         # Scaling state
         self._scalable_labels = []   # (widget, font_name, base_size, style)
@@ -76,34 +81,104 @@ class PowerMeterApp(ctk.CTk):
         self._layout_base_width = BASE_WIDTH
 
         # --- 2. UI LAYOUT ---
-        self.conn_frame = ctk.CTkFrame(self)
-        self.conn_frame.pack(fill="x", padx=10, pady=5)
-        self._scalable_pack.append((self.conn_frame, {"fill": "x", "padx": 10, "pady": 5}))
+        self.conn_frame = ctk.CTkFrame(
+            self, fg_color="#20262e", corner_radius=12,
+            border_width=1, border_color="#343e49")
+        self.conn_frame.pack(fill="x", padx=20, pady=(12, 4))
+        self._scalable_pack.append((self.conn_frame, {"fill": "x", "padx": 20, "pady": (12, 4)}))
+        self.conn_frame.grid_columnconfigure(0, weight=1)
+        self._connections_expanded = not bool(settings["last_port"])
 
-        self.port_var = ctk.StringVar(value=self._last_port or "Select Port")
-        self.port_menu = ctk.CTkOptionMenu(self.conn_frame, variable=self.port_var, values=self.get_ports())
-        self.port_menu.pack(side="left", padx=10, pady=10)
-        self._scalable_pack.append((self.port_menu, {"side": "left", "padx": 10, "pady": 10}))
+        header = ctk.CTkFrame(self.conn_frame, fg_color="transparent")
+        header.grid(row=0, column=0, sticky="ew", padx=16, pady=12)
+        header.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(header, text="POWER SOURCE", anchor="w", height=16,
+                     font=("Arial", 10, "bold"), text_color="#94a5b5").grid(
+                         row=0, column=0, sticky="w")
+        self.source_title = ctk.CTkLabel(header, anchor="w", height=28,
+                                        font=("Arial", 18, "bold"), text_color="#edf4fa")
+        self.source_title.grid(row=1, column=0, sticky="ew")
+        self.connection_summary = ctk.CTkLabel(header, anchor="w", height=18,
+                                              font=("Arial", 11))
+        self.connection_summary.grid(row=2, column=0, sticky="w")
+        self.active_connect_btn = ctk.CTkButton(
+            header, width=100, height=32, corner_radius=7,
+            command=lambda: self.toggle_connection(self.active_source))
+        self.active_connect_btn.grid(row=0, column=1, rowspan=2, padx=(12, 0))
+        self.manage_btn = ctk.CTkButton(
+            header, text="Manage devices", width=100, height=24,
+            fg_color="transparent", hover_color="#303c49", text_color="#a9c9e2",
+            font=("Arial", 11), command=self._toggle_connection_details)
+        self.manage_btn.grid(row=2, column=1, padx=(12, 0))
 
-        self.refresh_btn = ctk.CTkButton(self.conn_frame, text="Refresh", width=60, command=self.refresh_ports)
-        self.refresh_btn.pack(side="left", padx=5)
-        self._scalable_pack.append((self.refresh_btn, {"side": "left", "padx": 5}))
+        self.display_row = ctk.CTkFrame(self.conn_frame, fg_color="transparent")
+        self.display_row.grid(row=1, column=0, sticky="ew", padx=12, pady=(0, 12))
+        self.display_row.grid_columnconfigure((0, 1), weight=1, uniform="sources")
+        self.source_buttons = []
+        for index in range(2):
+            button = ctk.CTkButton(
+                self.display_row, width=100, height=36, corner_radius=7, border_width=1,
+                command=lambda i=index: self._select_source(i))
+            button.grid(row=0, column=index, sticky="ew", padx=4)
+            self.source_buttons.append(button)
 
-        self.connect_btn = ctk.CTkButton(self.conn_frame, text="Connect", fg_color="green", command=self.toggle_connection)
-        self.connect_btn.pack(side="left", padx=10)
-        self._scalable_pack.append((self.connect_btn, {"side": "left", "padx": 10}))
-
-        self.autoconnect_checkbox = ctk.CTkCheckBox(
-            self.conn_frame, text="Autoconnect", variable=self.autoconnect_var,
-            command=self._save_settings,
-        )
-        self.autoconnect_checkbox.pack(side="left", padx=5)
-        self._scalable_pack.append((self.autoconnect_checkbox, {"side": "left", "padx": 5}))
-
-        self.status_dot = ctk.CTkLabel(self.conn_frame, text="●", text_color="red", font=("Arial", 24))
-        self.status_dot.pack(side="right", padx=10)
-        self._scalable_pack.append((self.status_dot, {"side": "right", "padx": 10}))
-        self._scalable_labels.append((self.status_dot, "Arial", 24, ""))
+        self.connection_details = ctk.CTkFrame(
+            self.conn_frame, fg_color="#191f26", corner_radius=8)
+        self.connection_details.grid(row=2, column=0, sticky="ew", padx=12, pady=(0, 12))
+        self.connection_details.grid_columnconfigure(0, weight=1)
+        caption = ctk.CTkFrame(self.connection_details, fg_color="transparent")
+        caption.grid(row=0, column=0, sticky="ew", padx=12, pady=(10, 4))
+        ctk.CTkLabel(caption, text="Device connections", font=("Arial", 12, "bold"),
+                     text_color="#d1dce6").pack(side="left")
+        self.refresh_btn = ctk.CTkButton(
+            caption, text="Refresh ports", width=85, height=24,
+            fg_color="transparent", hover_color="#303c49", text_color="#a9c9e2",
+            command=self.refresh_ports)
+        self.refresh_btn.pack(side="right")
+        self.device_rows = []
+        port_menus, connect_buttons, status_labels = [], [], []
+        for index in range(2):
+            row = ctk.CTkFrame(self.connection_details, fg_color="transparent")
+            row.grid(row=index + 1, column=0, sticky="ew", padx=12, pady=5)
+            row.grid_columnconfigure(1, weight=1)
+            self.device_rows.append(row)
+            status = ctk.CTkLabel(row, text="\u25cf", width=16, font=("Arial", 14))
+            status.grid(row=0, column=0, padx=(0, 6))
+            status_labels.append(status)
+            entry = ctk.CTkEntry(
+                row, textvariable=self.source_names[index], width=100, height=32,
+                fg_color="#252e38", border_color="#3a4856", border_width=1,
+                corner_radius=6)
+            entry.grid(row=0, column=1, sticky="ew", padx=(0, 8))
+            entry.bind("<FocusOut>", self._names_changed)
+            entry.bind("<Return>", self._names_changed)
+            menu = ctk.CTkOptionMenu(
+                row, variable=self.source_ports[index], values=self.get_ports(), width=100,
+                height=32, fg_color="#303e4c", button_color="#3a4b5c",
+                button_hover_color="#485f73", corner_radius=6)
+            menu.grid(row=0, column=2, padx=(0, 8))
+            port_menus.append(menu)
+            button = ctk.CTkButton(row, width=90, height=32, corner_radius=6,
+                                   command=lambda i=index: self.toggle_connection(i))
+            button.grid(row=0, column=3)
+            connect_buttons.append(button)
+        self.port_var = self.source_ports[0]
+        self.port_menu, self.second_port_menu = port_menus
+        self.connect_btn, self.second_connect_btn = connect_buttons
+        self.status_dot, self.second_status = status_labels
+        self.second_row = self.device_rows[1]
+        footer = ctk.CTkFrame(self.connection_details, fg_color="transparent")
+        footer.grid(row=3, column=0, sticky="ew", padx=12, pady=(8, 12))
+        self.autoconnect_checkbox = ctk.CTkSwitch(
+            footer, text="Connect on startup", variable=self.autoconnect_var,
+            command=self._save_settings, progress_color="#387faa",
+            switch_width=32, switch_height=18, font=("Arial", 11))
+        self.autoconnect_checkbox.pack(side="left")
+        self.second_device_btn = ctk.CTkButton(
+            footer, width=140, height=26, fg_color="transparent", hover_color="#303c49",
+            text_color="#a9c9e2", font=("Arial", 11), command=self._change_second_device)
+        self.second_device_btn.pack(side="right")
+        self._update_source_controls()
 
         # --- 3. RECREATED DIGITAL DISPLAY ---
         lcd_blue_bg = "#82caff"
@@ -193,24 +268,29 @@ class PowerMeterApp(ctk.CTk):
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         if settings["maximized"]:
             self.state("zoomed")
-        if self.autoconnect_var.get() and self._last_port:
+        self.after(50, self._drain_serial_events)
+        if self.autoconnect_var.get():
             self.after(250, self._autoconnect)
 
     def _load_window_settings(self):
         defaults = {"width": BASE_WIDTH, "height": BASE_HEIGHT, "maximized": False,
-                    "x": None, "y": None, "last_port": "", "autoconnect": False}
+                    "x": None, "y": None, "last_port": "", "autoconnect": False,
+                    "second_enabled": False, "second_port": "", "first_name": "Device 1",
+                    "second_name": "Device 2", "active_source": 0}
         config = configparser.ConfigParser(interpolation=None)
         try:
             config.read_string(self._settings_path.read_text(encoding="utf-8"))
         except (OSError, configparser.Error):
             return defaults
         for key in defaults:
-            section = "connection" if key in ("last_port", "autoconnect") else "window"
+            section = "window" if key in ("width", "height", "x", "y", "maximized") else "connection"
             try:
-                if key in ("maximized", "autoconnect"):
+                if key in ("maximized", "autoconnect", "second_enabled"):
                     defaults[key] = config.getboolean(section, key, fallback=defaults[key])
-                elif key == "last_port":
-                    defaults[key] = config.get(section, key, fallback="").strip()
+                elif key in ("last_port", "second_port", "first_name", "second_name"):
+                    defaults[key] = config.get(section, key, fallback=defaults[key]).strip()
+                elif key == "active_source":
+                    defaults[key] = 1 if config.getint(section, key, fallback=0) == 1 else 0
                 else:
                     value = config.getint(section, key, fallback=defaults[key])
                     if key in ("x", "y") or 100 <= value <= 20000:
@@ -299,10 +379,17 @@ class PowerMeterApp(ctk.CTk):
                     "x": self._normal_position[0], "y": self._normal_position[1],
                     "maximized": self.state() == "zoomed"}
         try:
-            config = configparser.ConfigParser()
+            config = configparser.ConfigParser(interpolation=None)
             config["window"] = {key: str(value) for key, value in settings.items()}
-            config["connection"] = {"last_port": self._last_port,
-                                    "autoconnect": str(self.autoconnect_var.get())}
+            config["connection"] = {
+                "last_port": self.source_ports[0].get(),
+                "autoconnect": str(self.autoconnect_var.get()),
+                "second_enabled": str(self.second_enabled_var.get()),
+                "second_port": self.source_ports[1].get(),
+                "first_name": self.source_names[0].get(),
+                "second_name": self.source_names[1].get(),
+                "active_source": str(self.active_source),
+            }
             temporary_path = self._settings_path.with_suffix(".tmp")
             with temporary_path.open("w", encoding="utf-8") as settings_file:
                 config.write(settings_file)
@@ -312,10 +399,9 @@ class PowerMeterApp(ctk.CTk):
 
     def _on_close(self):
         self._save_settings()
-        self.running = False
         try:
-            if self.ser:
-                self.ser.close()
+            for index in range(2):
+                self._disconnect_source(index)
         except (OSError, serial.SerialException) as e:
             print(f"Could not close serial port: {e}")
         finally:
@@ -428,9 +514,98 @@ class PowerMeterApp(ctk.CTk):
             if i < len(slots_list):
                 slots_list[i].configure(text=char)
 
+    @staticmethod
+    def _new_source():
+        return {"serial": None, "stop": None, "generation": 0,
+                "history": [deque([0.0] * 50, maxlen=50) for _ in range(3)],
+                "latest": (0.0, 0.0, 0.0), "max": 0.0, "raw": "Ready"}
+
+    def _source_labels(self):
+        count = 2 if self.second_enabled_var.get() else 1
+        return [f"{i + 1}: {self.source_names[i].get().strip() or f'Device {i + 1}'}"
+                for i in range(count)]
+
+    def _names_changed(self, event=None):
+        self._update_source_controls()
+        self._save_settings()
+
+    def _update_source_controls(self):
+        dual = self.second_enabled_var.get()
+        if dual:
+            self.display_row.grid()
+            self.second_row.grid()
+        else:
+            self.display_row.grid_remove()
+            self.second_row.grid_remove()
+        if self._connections_expanded:
+            self.connection_details.grid()
+        else:
+            self.connection_details.grid_remove()
+        self.manage_btn.configure(text="Done" if self._connections_expanded else "Manage devices")
+        self.second_device_btn.configure(text="Remove second device" if dual else "+ Add second device")
+        for index, button in enumerate(self.source_buttons):
+            selected = index == self.active_source
+            name = self.source_names[index].get().strip() or f"Device {index + 1}"
+            button.configure(
+                text=("\u2713  " if selected else "") + name,
+                fg_color="#254c68" if selected else "#252e38",
+                hover_color="#315f80" if selected else "#303e4c",
+                border_color="#70b9e8" if selected else "#3a4856",
+                text_color="#edf7ff" if selected else "#a5b5c3")
+        for index, menu, button, status in [
+                (0, self.port_menu, self.connect_btn, self.status_dot),
+                (1, self.second_port_menu, self.second_connect_btn, self.second_status)]:
+            connected = self.sources[index]["serial"] is not None
+            enabled = index == 0 or dual
+            menu.configure(state="normal" if enabled and not connected else "disabled")
+            style = dict(text="Disconnect" if connected else "Connect",
+                         fg_color="#303e4c" if connected else "#287cae",
+                         hover_color="#435467" if connected else "#3494cd",
+                         text_color="#edf4fa")
+            button.configure(state="normal" if enabled else "disabled", **style)
+            status.configure(text_color="#66c9a1" if connected else "#778795")
+            if index == self.active_source:
+                self.active_connect_btn.configure(**style)
+        source = self.sources[self.active_source]
+        name = self.source_names[self.active_source].get().strip() or f"Device {self.active_source + 1}"
+        self.source_title.configure(text=name)
+        connected = source["serial"] is not None
+        port = self.source_ports[self.active_source].get()
+        error = source["raw"].startswith(("Cannot connect", "Disconnected:", port + " is already"))
+        state = "Connected" if connected else "Connection failed" if error else "Not connected"
+        detail = f"  /  {port}" if port not in ("", "Select Port", "No Ports Found") else ""
+        self.connection_summary.configure(
+            text=f"\u25cf  {state}{detail}",
+            text_color="#66c9a1" if connected else "#e0b47b" if error else "#94a5b5")
+
+    def _toggle_connection_details(self):
+        self._connections_expanded = not self._connections_expanded
+        self._update_source_controls()
+        self._save_settings()
+
+    def _change_second_device(self):
+        self.second_enabled_var.set(not self.second_enabled_var.get())
+        self._toggle_second()
+
+    def _toggle_second(self):
+        if not self.second_enabled_var.get():
+            self._disconnect_source(1)
+            self.active_source = 0
+        self._update_source_controls()
+        self._render_source()
+        self._save_settings()
+        if self.second_enabled_var.get() and self.autoconnect_var.get():
+            self._autoconnect()
+
+    def _select_source(self, index):
+        self.active_source = index
+        self._update_source_controls()
+        self._render_source()
+        self._save_settings()
+
     def reset_max(self):
-        self.max_current = 0.0
-        self.update_slots(self.max_slots, "00.00")
+        self.sources[self.active_source]["max"] = 0.0
+        self._render_source()
 
     def toggle_hold(self):
         self.is_held = not self.is_held
@@ -443,93 +618,154 @@ class PowerMeterApp(ctk.CTk):
         return [p.device for p in serial.tools.list_ports.comports()] or ["No Ports Found"]
 
     def refresh_ports(self):
-        new_ports = self.get_ports()
-        self.port_menu.configure(values=new_ports)
-        if self.port_var.get() not in new_ports and self._last_port in new_ports:
-            self.port_var.set(self._last_port)
-        elif self.port_var.get() not in new_ports and new_ports:
-            self.port_var.set(new_ports[0])
+        # Keep saved assignments when a device is absent; never substitute another meter.
+        ports = self.get_ports()
+        self.port_menu.configure(values=ports)
+        self.second_port_menu.configure(values=ports)
+        self._autoconnect()
 
     def _autoconnect(self):
-        if not self.running and self.autoconnect_var.get() and self._last_port:
-            self.port_var.set(self._last_port)
-            self.toggle_connection()
+        if not self.autoconnect_var.get():
+            return
+        for index in range(2 if self.second_enabled_var.get() else 1):
+            if self.sources[index]["serial"] is None:
+                self.toggle_connection(index)
+        # If the remembered display is absent, show the connected device.
+        if self.sources[self.active_source]["serial"] is None:
+            for index, source in enumerate(self.sources):
+                if source["serial"] is not None:
+                    self.active_source = index
+                    self._update_source_controls()
+                    self._render_source()
+                    break
 
-    def toggle_connection(self):
-        if not self.running:
-            port = self.port_var.get()
-            if port in ["No Ports Found", "Select Port"]:
+    def toggle_connection(self, index=0):
+        source = self.sources[index]
+        if source["serial"] is not None:
+            self._disconnect_source(index)
+        elif index == 0 or self.second_enabled_var.get():
+            port = self.source_ports[index].get()
+            if port in ("", "No Ports Found", "Select Port"):
                 return
-            try:
-                self.ser = serial.Serial(port, 115200, timeout=0.1)
-                self.running = True
-                self._last_port = port
-                self._save_settings()
-                self.connect_btn.configure(text="Disconnect", fg_color="red")
-                self.status_dot.configure(text_color="green")
-                threading.Thread(target=self.listen_serial, daemon=True).start()
-            except Exception as e:
-                self.raw_data_lbl.configure(text=f"Error: {e}")
-        else:
-            self.running = False
-            if self.ser:
-                self.ser.close()
-            self.connect_btn.configure(text="Connect", fg_color="green")
-            self.status_dot.configure(text_color="red")
+            if any(other["serial"] is not None and other["serial"].port.lower() == port.lower()
+                   for other in self.sources):
+                source["raw"] = f"{port} is already connected as the other source."
+            else:
+                try:
+                    connection = serial.Serial(port, 115200, timeout=0.1)
+                    source["serial"] = connection
+                    source["generation"] += 1
+                    source["stop"] = threading.Event()
+                    source["raw"] = f"Connected to {port}; waiting for data"
+                    if index == 0:
+                        self._last_port = port
+                    threading.Thread(target=self.listen_serial,
+                                     args=(index, connection, source["stop"], source["generation"]),
+                                     daemon=True).start()
+                except (OSError, serial.SerialException) as error:
+                    source["raw"] = f"Cannot connect to {port}: {error}"
+        self._update_source_controls()
+        self._render_source()
+        self._save_settings()
 
-    def listen_serial(self):
-        while self.running:
+    def _disconnect_source(self, index):
+        source = self.sources[index]
+        connection = source["serial"]
+        source["serial"] = None
+        source["generation"] += 1
+        if source["stop"] is not None:
+            source["stop"].set()
+        if connection is not None:
             try:
-                if self.ser.in_waiting:
-                    line = self.ser.readline().decode('utf-8', errors='ignore').strip()
-                    if line:
-                        self.after(0, lambda l=line: self.raw_data_lbl.configure(text=l))
-                        parts = line.split(',')
-                        if len(parts) >= 3:
-                            self.after(0, self.process_data, parts[0], parts[1], parts[2])
-            except:
+                connection.close()
+            except (OSError, serial.SerialException):
+                pass
+        source["raw"] = "Disconnected"
+
+    def listen_serial(self, index, connection, stop, generation):
+        # Workers only touch their own connection and queue; Tk stays on the main thread.
+        pending = b""
+        while not stop.is_set():
+            try:
+                chunk = connection.read_until(b"\n")
+                pending += chunk
+                if not pending.endswith(b"\n"):
+                    if len(pending) > 4096:
+                        pending = b""
+                    continue
+                line = pending.decode("utf-8", errors="ignore").strip()
+                pending = b""
+                if line:
+                    self._queue_serial_event((index, generation, "data", line), stop)
+            except (OSError, serial.SerialException) as error:
+                self._queue_serial_event((index, generation, "error", str(error)), stop)
                 break
 
-    def process_data(self, v_str, i_str, p_str):
-        try:
-            v, i, p = float(v_str), float(i_str), float(p_str)
-            self.update_slots(self.v_slots, f"{v:05.2f}")
-            self.update_slots(self.i_slots, f"{i:05.2f}")
-            self.update_slots(self.p_slots, f"{p:05.1f}")
-
-            if i > self.max_current:
-                self.max_current = i
-                self.update_slots(self.max_slots, f"{self.max_current:05.2f}")
-
-            if self.is_held:
+    def _queue_serial_event(self, event, stop):
+        while not stop.is_set():
+            try:
+                self._serial_events.put(event, timeout=0.1)
                 return
+            except queue.Full:
+                continue
 
-            self.history_v.append(v)
-            self.history_i.append(i)
-            self.history_p.append(p)
-
-            self.line_v.set_visible(self.show_v.get())
-            self.line_i.set_visible(self.show_i.get())
-            self.line_p.set_visible(self.show_p.get())
-
-            if self.show_v.get(): self.line_v.set_ydata(list(self.history_v))
-            if self.show_i.get(): self.line_i.set_ydata(list(self.history_i))
-            if self.show_p.get(): self.line_p.set_ydata(list(self.history_p))
-
-            self.ax.relim()
-            visible_data = []
-            if self.show_v.get(): visible_data.extend(list(self.history_v))
-            if self.show_i.get(): visible_data.extend(list(self.history_i))
-            if self.show_p.get(): visible_data.extend(list(self.history_p))
-
-            if visible_data and max(visible_data) > 0:
-                self.ax.set_ylim(0, max(visible_data) * 1.1)
+    def _drain_serial_events(self):
+        changed = False
+        for _ in range(200):
+            try:
+                index, generation, kind, value = self._serial_events.get_nowait()
+            except queue.Empty:
+                break
+            source = self.sources[index]
+            if source["generation"] != generation:
+                continue
+            if kind == "error":
+                self._disconnect_source(index)
+                source["raw"] = f"Disconnected: {value}"
+                self._update_source_controls()
             else:
-                self.ax.set_ylim(0, 10)
+                source["raw"] = value
+                parts = value.split(",")
+                if len(parts) >= 3:
+                    self.process_data(*parts[:3], index=index)
+            changed = changed or index == self.active_source
+        if changed:
+            self._render_source()
+        self.after(50, self._drain_serial_events)
 
-            self.canvas.draw_idle()
-        except:
-            pass
+    def process_data(self, v_str, i_str, p_str, index=None):
+        try:
+            values = float(v_str), float(i_str), float(p_str)
+        except ValueError:
+            return
+        if not all(math.isfinite(value) for value in values):
+            return
+        source = self.sources[self.active_source if index is None else index]
+        source["latest"] = values
+        source["max"] = max(source["max"], values[1])
+        if not self.is_held:
+            for history, value in zip(source["history"], values):
+                history.append(value)
+
+    def _render_source(self):
+        source = self.sources[self.active_source]
+        v, i, p = source["latest"]
+        self.update_slots(self.v_slots, f"{v:05.2f}")
+        self.update_slots(self.i_slots, f"{i:05.2f}")
+        self.update_slots(self.p_slots, f"{p:05.1f}")
+        self.update_slots(self.max_slots, f"{source['max']:05.2f}")
+        self.raw_data_lbl.configure(text=f"{self._source_labels()[self.active_source]}: {source['raw']}")
+        visible_data = []
+        for line, visible, history in zip(
+                (self.line_v, self.line_i, self.line_p),
+                (self.show_v, self.show_i, self.show_p), source["history"]):
+            line.set_visible(visible.get())
+            line.set_ydata(list(history))
+            if visible.get():
+                visible_data.extend(history)
+        self.ax.relim()
+        self.ax.set_ylim(0, max(visible_data) * 1.1 if visible_data and max(visible_data) > 0 else 10)
+        self.canvas.draw_idle()
 
 if __name__ == "__main__":
     app = PowerMeterApp()
